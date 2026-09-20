@@ -71,6 +71,10 @@ const $tickerPaused = atom(false)
 // Palette "Add Source" signals the page to open the Sources tab + focus add.
 const $addSourceSignal = atom(0)
 let addFocusArmed = false
+// Signal-lane shared state (renderer presentation, not engine truth).
+const $lastItem = atom(null)    // last focused ticker/page item (any lane)
+const $pinTab = atom(null)      // pin-chip click → page tab to surface
+const __seenWatch = new Set()   // watch-article ids already notified (cap 250)
 
 // ─────────────────────────────────────────────────────────────────────────
 // Constants
@@ -185,7 +189,10 @@ function ensureStyles() {
     /* Keyboard a11y: every plugin-owned button (tabs, brand, chips, candidates,
        page-row titles) gets a visible focus ring built from theme vars. */
     `.${ID}-page button:focus-visible, .${ID}-ticker button:focus-visible { outline: 1px solid var(--ui-accent); outline-offset: -1px; }`,
-    `.${ID}-page select:focus-visible { outline: 1px solid var(--ui-accent); outline-offset: 1px; }`
+    `.${ID}-page select:focus-visible { outline: 1px solid var(--ui-accent); outline-offset: 1px; }`,
+    /* Signal lanes (news · trades) + watch chips */
+    `.${ID}-dotbtn:hover { transform: scale(1.45); }`,
+    `.${ID}-watch { color: var(--ui-accent); font-weight: 700; }`
   ].join('\n')
   let style = document.getElementById(`${ID}-styles`)
   if (!style) {
@@ -274,9 +281,16 @@ async function openArticle(url, articleId) {
 
 // "Ask Hermes about this" — official SDK path: host.request is the gateway
 // JSON-RPC door (same one the app itself uses) and prompt.submit is the
-// documented submit method. Sends into the FOCUSED chat session.
-async function askHermes(a) {
-  const prompt = `Summarize this article and tell me why it matters:\n\n${a.title || '(untitled)'}\n${a.canonical_url || ''}`
+// documented submit method. Sends into the FOCUSED chat session. The item
+// shape is lane-aware: articles summarize, trades ask about the position.
+async function askHermes(it) {
+  if (!it) return
+  let prompt
+  if (it.kind === 'trade') {
+    prompt = `My Hyperliquid lane shows: ${it.title}${it.detail ? ` (${it.detail})` : ''}. Explain what this means and whether my position is at risk.`
+  } else {
+    prompt = `Summarize this article and tell me why it matters:\n\n${it.title || '(untitled)'}\n${it.url || it.canonical_url || ''}`
+  }
   const sid = host.state?.focusedSessionId?.get?.() || host.state?.activeSessionId?.get?.() || null
   try {
     if (!sid) throw new Error('No active chat session')
@@ -345,6 +359,16 @@ function useSources() {
   return [q, Array.isArray(q.data) ? q.data : []]
 }
 
+function useTrades() {
+  return useQuery({
+    queryKey: [ID, 'trades'],
+    queryFn: async () => ((await rest('/trades')) || {}),
+    refetchInterval: 45_000,
+    staleTime: 40_000,
+    retry: 1
+  })
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Ticker (statusbar)
 // ─────────────────────────────────────────────────────────────────────────
@@ -373,40 +397,45 @@ function useIconDataUrl(u) {
   return u ? (q.data || null) : null
 }
 
-function TickerItem({ a, settings }) {
-  const age = settings?.relative_time !== false ? relTime(a.published_at) : ''
-  const iconSrc = useIconDataUrl(a.favicon_url)
+function TickerItem({ it, settings }) {
+  const age = it.published_at && settings?.relative_time !== false ? relTime(it.published_at) : (it.age || '')
+  const isArticle = it.kind !== 'trade'
+  const iconSrc = useIconDataUrl(it.favicon_url)
   return jsx('button', {
     className: `${ID}-item`,
-    'data-read': a.read ? '1' : '0',
-    title: `${a.source_name} — ${a.title}`,
-    'aria-label': `${a.source_name}: ${a.title}${age ? ` (${age})` : ''} — activate to open, or right-click / long-press to ask Hermes`,
-    onClick: () => void openArticle(a.canonical_url || '', a.id),
+    'data-read': it.read ? '1' : '0',
+    title: `${it.label || it.source_name || ''} — ${it.title}${it.detail ? ` (${it.detail})` : ''}`,
+    'aria-label': `${it.label || it.source_name || ''}: ${it.title} — activate to open, or right-click / long-press to ask Hermes`,
+    onClick: () => {
+      $lastItem.set(it)
+      if (it.url) void openArticle(it.url, isArticle ? it.id : null)
+    },
     onContextMenu: e => {
       e.preventDefault()
-      void askHermes(a)
+      $lastItem.set(it)
+      void askHermes(it)
     },
     children: jsxs('span', {
       style: { display: 'inline-flex', alignItems: 'center', gap: '0.375rem' },
       children: [
-        a.favicon_url
-          ? jsx(Favicon, { url: a.favicon_url })
-          : jsx('span', { className: `${ID}-dot`, children: '◆' }),
-        settings?.show_source !== false ? jsx('span', { className: `${ID}-src`, children: `${a.source_name}:` }) : null,
-        jsx('span', { className: `${ID}-headline`, children: a.title }),
+        it.favicon_url
+          ? jsx(Favicon, { url: it.favicon_url })
+          : jsx('span', { className: `${ID}-dot`, children: it.sym || '◆' }),
+        settings?.show_source !== false ? jsx('span', { className: `${ID}-src`, children: `${it.label || it.source_name}:` }) : null,
+        jsx('span', { className: `${ID}-headline${it.watch ? ` ${ID}-watch` : ''}`, children: it.title }),
         age ? jsx('span', { className: `${ID}-age`, children: `· ${age}` }) : null
       ]
     })
   })
 }
 
-function TickerHalf({ articles, settings }) {
+function TickerHalf({ items, settings }) {
   return jsx('div', {
     className: `${ID}-half`,
     'aria-hidden': 'true',
-    children: articles.map((a, i) => a.__divider
-      ? jsx('span', { className: `${ID}-divider`, key: `d${i}`, children: `${a.source_name} —` })
-      : jsx(TickerItem, { a, settings }, `h${a.id}`))
+    children: items.map((it, i) => it.__divider
+      ? jsx('span', { className: `${ID}-divider`, key: `d${i}`, children: `${it.label} —` })
+      : jsx(TickerItem, { it, settings }, `t${it.key || i}`))
   })
 }
 
@@ -479,11 +508,52 @@ function TickerRefresh() {
   })
 }
 
+// Build the flat ticker item stream: [trades lane] [news lane].
+function buildTickerItems({ articles, grouping, trades, lanes, paused }) {
+  const out = []
+  const laneOn = k => !lanes || lanes[k] !== false
+  if (laneOn('trades') && trades) {
+    const t = trades
+    if (Array.isArray(t.positions) && t.positions.length) {
+      t.positions.slice(0, 4).forEach(p => {
+        const sign = p.upnl >= 0 ? '+' : ''
+        const liqTxt = p.liq_pct != null ? ` · liq ${p.liq_pct}%` : ''
+        const cvTxt = p.conviction != null ? ` · cv ${p.conviction}` : ''
+        out.push({
+          kind: 'trade', lane: 'trades', key: `t${p.coin}`, label: 'TRADES',
+          sym: p.side === 'LONG' ? '▲' : '▼',
+          title: `${p.coin} ${p.side} ${p.size} · ${sign}$${p.upnl} · ${p.lev || '?'}x${liqTxt}${cvTxt}`,
+          detail: `entry ${p.entry_px} mark ${p.mark_px}`, url: null
+        })
+      })
+    } else if (t.total_value != null || t.account_value != null) {
+      const last = (t.fills && t.fills[0]) || null
+      const lastTxt = last ? ` · last ${last.dir} ${last.sz} ${last.coin} @ ${last.px}` : ''
+      // total_value = perp margin + spot cash. account_value alone reads $0 on a
+      // flat-but-funded account (Hyperliquid keeps the two ledgers separate).
+      const acct = t.total_value ?? t.account_value
+      const split = t.spot_value != null ? ` · perp $${t.account_value} + spot $${t.spot_value}` : ''
+      out.push({
+        kind: 'trade', lane: 'trades', key: 'tflat', label: 'TRADES', sym: '◆',
+        title: `Flat · acct $${acct}${split}${lastTxt}`,
+        detail: t.error || '', url: null
+      })
+    } else if (t.error) {
+      out.push({ kind: 'trade', lane: 'trades', key: 'terr', label: 'TRADES', sym: '!', title: `HL: ${t.error}`, detail: '', url: null })
+    }
+  }
+  const newsItems = groupTickerArticles(paused ? [] : (articles || []), grouping)
+    .map(a => ({ kind: 'article', lane: 'news', key: `n${a.id}`, label: a.source_name, title: a.title, age: '', published_at: a.published_at, url: a.canonical_url, id: a.id, read: a.read, watch: a.watch, favicon_url: a.favicon_url }))
+  out.push(...newsItems)
+  return out
+}
+
 function NewswireTicker() {
   const [settingsQ, settings] = useSettings()
   const paused = useValue($tickerPaused)
   const enabled = settings ? settings.ticker_enabled !== false : false
   const duration = SPEED_DURATIONS[settings?.ticker_speed] || 150
+  const lanes = settings?.ticker_lanes || { news: true, trades: true }
 
   const articlesQ = useQuery({
     queryKey: [ID, 'ticker', settings?.only_unread === true],
@@ -496,13 +566,15 @@ function NewswireTicker() {
     staleTime: TICKER_POLL_MS - 5_000,
     retry: false
   })
+  const tradesQ = useTrades()
   const reduced = useReducedMotion()
   useAgeTick()
   const fontSizePx = Math.min(20, Math.max(9, Number(settings?.ticker_font_size) || 11))
   const grouping = settings?.ticker_grouping || 'newest'
-  const articles = useMemo(
-    () => groupTickerArticles(paused ? [] : (articlesQ.data || []), grouping),
-    [settings, articlesQ.data, paused, grouping]
+
+  const flatItems = useMemo(
+    () => buildTickerItems({ articles: articlesQ.data || [], grouping, trades: tradesQ.data, lanes, paused }),
+    [settings, articlesQ.data, tradesQ.data, paused, grouping, lanes]
   )
   openArticleMode = settings?.open_article_behavior === 'external' ? 'external' : 'internal'
 
@@ -514,19 +586,46 @@ function NewswireTicker() {
     if (settings && applyTickerSettingsFn) applyTickerSettingsFn(settings)
   }, [settings?.ticker_font_size, settings?.ticker_enabled])
 
+  // Watchlist match → desktop notification (deduped per article id).
+  const notifyEnabled = settings?.notify_on_watch !== false
+  useEffect(() => {
+    if (!notifyEnabled) return
+    const list = articlesQ.data || []
+    for (let i = 0; i < list.length; i++) {
+      const a = list[i]
+      if (a.watch && !a.read && !__seenWatch.has(a.id)) {
+        __seenWatch.add(a.id)
+        if (__seenWatch.size > 250) __seenWatch.delete(__seenWatch.values().next().value)
+        if (i < 8) host.notify({ kind: 'info', message: `📰 ${a.source_name}: ${a.title}` })
+      }
+    }
+  }, [articlesQ.data, notifyEnabled])
+
+  // Pins = watch-matched news (Alert pins).
+  const pins = useMemo(() => {
+    const out = []
+    for (const a of (articlesQ.data || [])) if (a.watch) out.push({ lane: 'news', severity: 'high', title: a.title })
+    return out.slice(0, 9)
+  }, [articlesQ.data])
+
+  const onPinOpen = () => {
+    $pinTab.set('watchlist')
+    host.navigate(PAGE_PATH)
+  }
+
   // Reduced motion: rotate ONE static headline instead of a marquee.
   const [rotIdx, setRotIdx] = useState(0)
   useEffect(() => {
-    if (!reduced || articles.length === 0) return
-    const t = setInterval(() => setRotIdx(i => (i + 1) % articles.length), ROTATE_MS)
+    if (!reduced || flatItems.length === 0) return
+    const t = setInterval(() => setRotIdx(i => (i + 1) % flatItems.length), ROTATE_MS)
     return () => clearInterval(t)
-  }, [reduced, articles.length])
+  }, [reduced, flatItems.length])
 
   if (!enabled) return null
   if (settingsQ.isLoading && !settings) {
     return jsx('div', { className: `${ID}-ticker`, style: { '--nw-font': `${fontSizePx}px` }, children: jsx('span', { className: `${ID}-brand`, children: 'NEWSWIRE' }) })
   }
-  if (articles.length === 0) {
+  if (flatItems.length === 0) {
     return jsxs('div', {
       className: `${ID}-ticker`,
       style: { '--nw-font': `${fontSizePx}px` },
@@ -549,14 +648,14 @@ function NewswireTicker() {
   }
 
   const content = reduced
-    ? jsx('div', { className: `${ID}-viewport`, children: jsx(TickerItem, { a: articles[rotIdx % articles.length], settings }) })
+    ? jsx('div', { className: `${ID}-viewport`, children: jsx(TickerItem, { it: flatItems[rotIdx % flatItems.length], settings }) })
     : jsx('div', { className: `${ID}-viewport`, children:
         jsx('div', {
           className: `${ID}-track ${ID}-marquee`,
           style: { '--nw-duration': `${duration}s` },
           children: [
-            jsx(TickerHalf, { articles, settings, key: 'a' }),
-            jsx(TickerHalf, { articles, settings, key: 'b' })
+            jsx(TickerHalf, { items: flatItems, settings, key: 'a' }),
+            jsx(TickerHalf, { items: flatItems, settings, key: 'b' })
           ]
         })})
 
@@ -574,6 +673,7 @@ function NewswireTicker() {
         children: 'NEWSWIRE'
       }),
       jsx(TickerRefresh, {}),
+      settings?.pins_enabled !== false && pins.length ? jsx('span', { className: `${ID}-pinscount`, title: 'Watch-matched headlines', children: `${pins.length} watch` }) : null,
       content
     ]
   })
@@ -592,7 +692,10 @@ function ArticleRow({ a }) {
           className: `${ID}-rowtitle`,
           style: { textAlign: 'left', background: 'none', border: 0, padding: 0, cursor: 'pointer', font: 'inherit' },
           title: a.canonical_url || '',
-          onClick: () => void openArticle(a.canonical_url || '', a.id),
+          onClick: () => {
+            $lastItem.set({ kind: 'article', title: a.title, url: a.canonical_url, id: a.id })
+            void openArticle(a.canonical_url || '', a.id)
+          },
           children: a.title || '(untitled)'
         }),
         a.summary ? jsx('div', { className: `${ID}-rowsum`, children: a.summary }) : null,
@@ -613,7 +716,7 @@ function ArticleRow({ a }) {
       jsx(Button, {
         size: 'xs', variant: 'ghost',
         title: 'Send this headline to the focused Hermes chat',
-        onClick: () => void askHermes(a),
+        onClick: () => { $lastItem.set({ kind: 'article', title: a.title, url: a.canonical_url, id: a.id }); void askHermes(a) },
         children: 'Ask…'
       }),
       jsx(Button, {
@@ -795,8 +898,104 @@ function LatestTab({ sources, prefs, setPrefs }) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Page — Sources
+// Page — Watchlist / Trades / Agent (signal-lane detail tabs)
 // ─────────────────────────────────────────────────────────────────────────
+
+function WatchlistTab({ sources, prefs, setPrefs }) {
+  const [settingsQ, settings] = useSettings()
+  const arts = useQuery({
+    queryKey: [ID, 'articles', 'watch'],
+    queryFn: () => rest('/articles?watch=1&limit=100'),
+    refetchInterval: PAGE_POLL_MS,
+    staleTime: 15_000,
+    retry: 1
+  })
+  const notify = useMutation({
+    mutationFn: v => rest('/settings', { method: 'PATCH', body: { notify_on_watch: v } }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: [ID, 'settings'] })
+  })
+  useAgeTick(60_000)
+  const items = Array.isArray(arts.data?.items) ? arts.data.items : []
+  return jsxs('div', { className: `${ID}-page`, children: [
+    jsxs('div', { className: `${ID}-tabs`, children: [
+      jsx('span', { className: 'text-sm text-(--ui-text-primary)', children: `Watchlist (${arts.data?.total ?? 0})` }),
+      jsx('span', { className: 'text-xs text-(--ui-text-quaternary)', children: (settings?.watchlist || []).join(', ') }),
+      jsx('span', { style: { flex: 1 } }),
+      jsx('label', { className: `${ID}-setlabel`, style: { gap: '0.375rem', display: 'inline-flex', alignItems: 'center' }, children: [
+        jsx(Switch, { size: 'xs', checked: settings?.notify_on_watch !== false, onCheckedChange: v => notify.mutate(v) }),
+        'Notify on match'
+      ]})
+    ]}),
+    jsx('div', { className: `${ID}-scrollwrap`, children:
+      jsx(ScrollArea, { className: 'h-full', children:
+        arts.isLoading
+          ? jsx('div', { className: 'grid h-full place-items-center p-4', children: jsx(GlyphSpinner, {}) })
+          : items.length === 0
+            ? jsxs('div', { className: `${ID}-card`, children: [
+                jsx('span', { className: `${ID}-setlabel`, style: { fontSize: '0.8125rem', color: 'var(--ui-text-primary)', fontWeight: 600 }, children: 'No watchlist hits yet' }),
+                jsx('span', { className: 'text-xs text-(--ui-text-quaternary)', children: 'Matched headlines appear here, light up in the ticker, and can fire a desktop notification. Edit keywords in Settings → Signals.' })
+              ]})
+            : jsx('div', { className: `${ID}-list`, children: items.map(a => jsx(ArticleRow, { a, key: a.id })) })
+      })
+    })
+  ]})
+}
+
+function TradesTab() {
+  const q = useTrades()
+  const t = q.data || {}
+  const refresh = () => queryClient.invalidateQueries({ queryKey: [ID, 'trades'] })
+  const pos = t.positions || []
+  const spot = t.spot || []
+  const fills = t.fills || []
+  return jsxs('div', { className: `${ID}-page`, children: [
+    jsxs('div', { className: `${ID}-tabs`, children: [
+      jsx('span', { className: 'text-sm text-(--ui-text-primary)', children: 'Hyperliquid' }),
+      (t.total_value ?? t.account_value) != null ? jsx(Badge, { variant: 'outline', children: `acct $${t.total_value ?? t.account_value}${t.spot_value != null ? ` (perp $${t.account_value} + spot $${t.spot_value})` : ''}${t.withdrawable != null ? ` · withdrawable $${t.withdrawable}` : ''}` }) : null,
+      t.fetched_at ? jsx('span', { className: 'text-xs text-(--ui-text-quaternary)', children: `as of ${relTime(t.fetched_at)} ago` }) : null,
+      jsx('span', { style: { flex: 1 } }),
+      jsx(Button, { size: 'xs', variant: 'ghost', onClick: () => refresh(), disabled: q.isFetching, children: q.isFetching ? 'Refreshing…' : 'Refresh' })
+    ]}),
+    t.error ? jsx('div', { className: `${ID}-card`, children: jsx('span', { className: `${ID}-err`, children: `Hyperliquid: ${t.error}` }) }) : null,
+    jsx('div', { className: `${ID}-scrollwrap`, children:
+      jsx(ScrollArea, { className: 'h-full', children:
+        q.isLoading
+          ? jsx('div', { className: 'grid h-full place-items-center p-4', children: jsx(GlyphSpinner, {}) })
+          : jsxs('div', { children: [
+              pos.length === 0 && !t.error
+                ? jsxs('div', { className: `${ID}-card`, children: [
+                    jsx('span', { className: `${ID}-setlabel`, style: { fontSize: '0.8125rem', color: 'var(--ui-text-primary)', fontWeight: 600 }, children: 'No open positions' }),
+                    jsx('span', { className: 'text-xs text-(--ui-text-quaternary)', children: 'Account is flat. The ticker trades lane shows account value + last fill instead.' })
+                  ]})
+                : jsx('div', { className: `${ID}-list`, children: pos.map(p => jsxs('div', { className: `${ID}-row`, children: [
+                    jsx('div', { className: `${ID}-rowmain`, children: [
+                      jsxs('span', { className: 'text-sm text-(--ui-text-primary)', children: [
+                        p.coin,
+                        p.dex ? jsx(Badge, { variant: 'outline', children: p.dex }) : null,
+                        jsx(Badge, { variant: 'outline', children: `${p.side} ${p.lev}x` })
+                      ]}),
+                      jsxs('div', { className: `${ID}-meta`, children: [
+                        jsx('span', { children: `${p.size} @ ${p.entry_px}` }),
+                        jsx('span', { children: `mark ${p.mark_px}` }),
+                        p.liq_pct != null ? jsx('span', { children: `liq -${p.liq_pct}% (${p.liq_px})` }) : null,
+                        p.conviction != null ? jsx('span', { children: `conviction ${p.conviction}` }) : null,
+                        jsx('span', { children: `margin $${p.margin_used}` })
+                      ]})
+                    ]}),
+                    jsx('span', { className: 'text-sm font-semibold', style: { color: (p.upnl || 0) >= 0 ? 'var(--ui-green, #46a758)' : 'var(--ui-red, #e5484d)' }, children: `${(p.upnl || 0) >= 0 ? '+' : ''}$${p.upnl} (${(p.upnl_pct || 0) >= 0 ? '+' : ''}${p.upnl_pct}%)` })
+                  ] }, `pos${p.coin}`)) }),
+              spot.length ? jsxs('div', { className: `${ID}-section`, children: ['Spot', jsx('span', { className: `${ID}-sectioncount`, children: spot.length })] }) : null,
+              spot.length ? jsx('div', { className: `${ID}-chips`, style: { padding: '0 1rem .5rem' }, children: spot.map(b => jsx('span', { className: `${ID}-chip`, children: `${b.coin} · ${b.total}${b.usd != null ? ` ($${b.usd})` : ''}` }, b.coin)) }) : null,
+              fills.length ? jsxs('div', { className: `${ID}-section`, children: ['Recent fills', jsx('span', { className: `${ID}-sectioncount`, children: fills.length })] }) : null,
+              fills.length ? jsx('div', { className: `${ID}-list`, children: fills.map((f, i) => jsxs('div', { className: `${ID}-row`, children: [
+                jsx('div', { className: `${ID}-rowmain`, children: jsx('span', { className: 'text-sm text-(--ui-text-primary)', children: `${f.dir} ${f.sz} ${f.coin} @ ${f.px}` }) }),
+                jsx('span', { className: 'text-xs text-(--ui-text-quaternary)', children: f.time ? relTime(new Date(Number(f.time)).toISOString()) : '' })
+              ] }, `fill${i}`)) }) : null
+            ]})
+      })
+    })
+  ]})
+}
 
 function AddSourceCard({ onAdded, autofocus }) {
   const [url, setUrl] = useState('')
@@ -819,6 +1018,11 @@ function AddSourceCard({ onAdded, autofocus }) {
   const search = async () => {
     setError(''); setCandidates(null); setBusy(true)
     try {
+      // Telegram channel: paste https://t.me/<user> or t.me/s/<user> → instant add.
+      if (/^https?:\/\/(t\.me|telegram\.me)\//i.test(url.trim())) {
+        await rest('/sources', { method: 'POST', body: { kind: 'telegram', feed_url: url.trim() } })
+        setUrl(''); onAdded(); return
+      }
       const out = await rest('/search', { method: 'POST', body: { query: url.trim() } })
       let cands = out.results || []
       if (out.via === 'discovery') cands = cands.filter(c => c.is_feed)
@@ -834,7 +1038,13 @@ function AddSourceCard({ onAdded, autofocus }) {
   const add = async (feedUrl) => {
     setBusy(true); setError('')
     try {
-      await rest('/sources', { method: 'POST', body: { url: looksLikeUrl ? url.trim() : '', feed_url: feedUrl } })
+      const isTg = /^https?:\/\/(t\.me|telegram\.me)\//i.test(feedUrl || '')
+      await rest('/sources', {
+        method: 'POST',
+        body: isTg
+          ? { kind: 'telegram', feed_url: feedUrl }
+          : { url: looksLikeUrl ? url.trim() : '', feed_url: feedUrl }
+      })
       setUrl(''); setCandidates(null)
       onAdded()
     } catch (e) {
@@ -935,6 +1145,7 @@ function SourceRow({ s, onChanged }) {
     jsxs('div', { style: { flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: '0.125rem' }, children: [
       jsxs('span', { className: 'text-sm text-(--ui-text-primary)', children: [
         s.name,
+        s.kind === 'telegram' ? jsx(Badge, { variant: 'outline', children: 'telegram' }) : null,
         s.enabled ? null : jsx(Badge, { variant: 'outline', children: 'disabled' }),
         s.category ? jsx(Badge, { variant: 'outline', children: s.category }) : null
       ]}),
@@ -1106,6 +1317,9 @@ function SettingsTab() {
   // invariant across renders (useSettings polls, so isError flips at runtime;
   // a return between hooks = React "rendered fewer hooks" crash).
   const [saveError, setSaveError] = useState('')
+  const [hlAddr, setHlAddr] = useState(s?.hl_address || '')
+  const [watchText, setWatchText] = useState((s?.watchlist || []).join(', '))
+  openArticleMode = s?.open_article_behavior === 'external' ? 'external' : 'internal'
   const save = useMutation({
     mutationFn: patch => rest('/settings', { method: 'PATCH', body: patch }),
     onSuccess: (_data, patch) => {
@@ -1198,7 +1412,34 @@ function SettingsTab() {
           jsx(Choice, { label: 'Default refresh interval', k: 'refresh_interval', options: INTERVAL_OPTIONS }),
           jsx(Choice, { label: 'Max article age', k: 'max_article_age_hours', options: AGE_OPTIONS }),
           jsx(Choice, { label: 'Max stored headlines', k: 'max_headlines', options: LIMIT_OPTIONS }),
-          jsx('div', { className: 'text-xs text-(--ui-text-quaternary)', children: 'Feeds are polled by the backend with ETag/Last-Modified caching; unchanged feeds are not re-downloaded. Per-source refresh overrides: Sources → Edit.' })
+          jsx('div', { className: 'text-xs text-(--ui-text-quaternary)', children: 'Feeds are polled by the backend with ETag/Last-Modified caching; unchanged feeds are not re-downloaded. Per-source refresh overrides: Sources → Edit.' }),
+          jsx(Separator, {}),
+          jsx('div', { className: `${ID}-setgroup`, children: 'Signal lanes' }),
+          jsx('div', { className: `${ID}-setrow`, children: ['news', 'trades'].map(k =>
+            jsxs('span', { key: k, style: { display: 'inline-flex', gap: '0.375rem', alignItems: 'center' }, children: [
+              jsx(Switch, { size: 'xs', checked: (s.ticker_lanes || {})[k] !== false, onCheckedChange: v => save.mutate({ ticker_lanes: { ...(s.ticker_lanes || {}), [k]: v } }) }),
+              jsx('span', { className: `${ID}-setlabel`, children: `${k} lane` })
+            ]})
+          )}),
+          jsx(Separator, {}),
+          jsx('div', { className: `${ID}-setgroup`, children: 'Signals' }),
+          jsx('div', { className: `${ID}-setrow`, children: [
+            jsx('span', { className: `${ID}-setlabel`, children: 'Watchlist keywords (comma-separated)' }),
+            jsx('span', { style: { display: 'flex', gap: '0.5rem', alignItems: 'center' }, children: [
+              jsx(Input, { value: watchText, onChange: e => setWatchText(typeof e === 'string' ? e : e?.target?.value ?? ''), placeholder: 'HYPE, BTC, ETH, SOL', style: { width: '12rem' } }),
+              jsx(Button, { size: 'xs', variant: 'outline', onClick: () => save.mutate({ watchlist: watchText.split(',').map(x => x.trim().toUpperCase()).filter(Boolean) }), children: 'Save' })
+            ]})
+          ]}),
+          jsx(Toggle, { label: 'Notify on watchlist match', k: 'notify_on_watch' }),
+          jsx('div', { className: `${ID}-setrow`, children: [
+            jsx('span', { className: `${ID}-setlabel`, children: 'Hyperliquid address (public reads only)' }),
+            jsx('span', { style: { display: 'flex', gap: '0.5rem', alignItems: 'center' }, children: [
+              jsx(Input, { value: hlAddr, onChange: e => setHlAddr(typeof e === 'string' ? e : e?.target?.value ?? ''), placeholder: '0x…', style: { width: '15rem' } }),
+              jsx(Button, { size: 'xs', variant: 'outline', onClick: () => save.mutate({ hl_address: hlAddr.trim() }), children: 'Save' })
+            ]})
+          ]}),
+          jsx(Choice, { label: 'Trade poll interval', k: 'hl_poll_interval', options: [{ id: '15', label: '15s' }, { id: '30', label: '30s' }, { id: '60', label: '60s' }, { id: '300', label: '5m' }] }),
+          jsx(Toggle, { label: 'Pin high-severity signals (pins cluster)', k: 'pins_enabled' })
         ]})
       })
     })
@@ -1213,6 +1454,7 @@ function NewswirePage() {
   const [tab, setTab] = useState(() => storageGet?.('lastTab', 'latest') || 'latest')
   const [prefs, setPrefsRaw] = useState(() => storageGet?.('latestPrefs', {}) || {})
   const addSignal = useValue($addSourceSignal)
+  const pinTab = useValue($pinTab)
   const addArmed = useRef(0)
   const [, sources] = useSources()
   const onChanged = () => queryClient.invalidateQueries({ queryKey: [ID] })
@@ -1229,14 +1471,34 @@ function NewswirePage() {
     }
   }, [addSignal])
 
+  // Pin-chip click → open the tab that explains the pin.
+  useEffect(() => {
+    if (pinTab) {
+      setTab(pinTab)
+      $pinTab.set(null)
+    }
+  }, [pinTab])
+
+  const tabBtn = (id, label) => jsx('button', {
+    className: `${ID}-tab`, role: 'tab',
+    'aria-selected': tab === id ? 'true' : 'false',
+    'data-active': tab === id ? '1' : '0',
+    onClick: () => setTab(id),
+    children: label
+  }, id)
+
   return jsxs('div', { className: `${ID}-page`, children: [
     jsxs('div', { className: `${ID}-tabs`, role: 'tablist', 'aria-label': 'Newswire sections', children: [
       jsx('span', { style: { fontWeight: 700, fontSize: '0.75rem', letterSpacing: '0.08em', color: 'var(--ui-accent)' }, children: 'NEWSWIRE' }),
-      jsx('button', { className: `${ID}-tab`, role: 'tab', 'aria-selected': tab === 'latest' ? 'true' : 'false', 'data-active': tab === 'latest' ? '1' : '0', onClick: () => setTab('latest'), children: 'Latest' }),
-      jsx('button', { className: `${ID}-tab`, role: 'tab', 'aria-selected': tab === 'sources' ? 'true' : 'false', 'data-active': tab === 'sources' ? '1' : '0', onClick: () => setTab('sources'), children: `Sources${sources.length ? ` (${sources.length})` : ''}` }),
-      jsx('button', { className: `${ID}-tab`, role: 'tab', 'aria-selected': tab === 'settings' ? 'true' : 'false', 'data-active': tab === 'settings' ? '1' : '0', onClick: () => setTab('settings'), children: 'Settings' })
+      tabBtn('latest', 'Latest'),
+      tabBtn('watchlist', 'Watchlist'),
+      tabBtn('trades', 'Trades'),
+      tabBtn('sources', `Sources${sources.length ? ` (${sources.length})` : ''}`),
+      tabBtn('settings', 'Settings')
     ]}),
     tab === 'latest' ? jsx(LatestTab, { sources, prefs, setPrefs }) :
+    tab === 'watchlist' ? jsx(WatchlistTab, { sources, prefs, setPrefs }) :
+    tab === 'trades' ? jsx(TradesTab, {}) :
     tab === 'sources' ? jsx(SourcesTab, { sources, onChanged, autofocusAdd: addFocusArmed }) :
     jsx(SettingsTab, {})
   ]})
@@ -1392,6 +1654,23 @@ export default {
             addFocusArmed = true
             $addSourceSignal.set($addSourceSignal.get() + 1)
             host.navigate(PAGE_PATH)
+          }
+        }
+      },
+      {
+        id: 'askLast',
+        area: PALETTE_AREA,
+        data: {
+          id: `${ID}.askLast`,
+          label: 'Newswire: Ask Hermes About Last Item',
+          keywords: ['newswire', 'ask', 'hermes', 'headline', 'position'],
+          run: () => {
+            const it = $lastItem.get()
+            if (!it) {
+              host.notify({ kind: 'info', message: 'Click a Newswire headline (or position) first, then run this again.' })
+              return
+            }
+            void askHermes(it)
           }
         }
       }
